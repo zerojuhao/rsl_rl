@@ -211,6 +211,7 @@ class PPOAmp(PPO):
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
+                
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # returned shape: [batch_size * num_aug, ...]
@@ -301,38 +302,38 @@ class PPOAmp(PPO):
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Symmetry loss
-            if self.symmetry:
-                # obtain the symmetric actions
-                # if we did augmentation before then we don't need to augment again
-                if not self.symmetry["use_data_augmentation"]:
-                    data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
-                    # compute number of augmentations per sample
-                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+            # # Symmetry loss
+            # if self.symmetry:
+            #     # obtain the symmetric actions
+            #     # if we did augmentation before then we don't need to augment again
+            #     if not self.symmetry["use_data_augmentation"]:
+            #         data_augmentation_func = self.symmetry["data_augmentation_func"]
+            #         obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
+            #         # compute number of augmentations per sample
+            #         num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                # actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+            #     # actions predicted by the actor for symmetrically-augmented observations
+            #     mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
 
-                # compute the symmetrically augmented actions
-                # note: we are assuming the first augmentation is the original one.
-                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
-                #   However, the symmetry loss is computed using the mean of the distribution.
-                action_mean_orig = mean_actions_batch[:original_batch_size]
-                _, actions_mean_symm_batch = data_augmentation_func(
-                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
-                )
+            #     # compute the symmetrically augmented actions
+            #     # note: we are assuming the first augmentation is the original one.
+            #     #   We do not use the action_batch from earlier since that action was sampled from the distribution.
+            #     #   However, the symmetry loss is computed using the mean of the distribution.
+            #     action_mean_orig = mean_actions_batch[:original_batch_size]
+            #     _, actions_mean_symm_batch = data_augmentation_func(
+            #         obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
+            #     )
 
-                # compute the loss (we skip the first augmentation as it is the original one)
-                mse_loss = torch.nn.MSELoss()
-                symmetry_loss = mse_loss(
-                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
-                )
-                # add the loss to the total loss
-                if self.symmetry["use_mirror_loss"]:
-                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                else:
-                    symmetry_loss = symmetry_loss.detach()
+            #     # compute the loss (we skip the first augmentation as it is the original one)
+            #     mse_loss = torch.nn.MSELoss()
+            #     symmetry_loss = mse_loss(
+            #         mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+            #     )
+            #     # add the loss to the total loss
+            #     if self.symmetry["use_mirror_loss"]:
+            #         loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+            #     else:
+            #         symmetry_loss = symmetry_loss.detach()
 
             # Random Network Distillation loss
             # TODO: Move this processing to inside RND module.
@@ -423,8 +424,8 @@ class PPOAmp(PPO):
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
             # -- Symmetry loss
-            if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+            # if mean_symmetry_loss is not None:
+            #     mean_symmetry_loss += symmetry_loss.item()
             # -- AMP loss
             if mean_amp_loss is not None:
                 mean_amp_loss += amp_loss.item()
@@ -460,7 +461,7 @@ class PPOAmp(PPO):
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
-        if self.symmetry:
+        # if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
         loss_dict["amp"] = mean_amp_loss
         loss_dict["amp_grad_penalty"] = mean_grad_penalty_loss

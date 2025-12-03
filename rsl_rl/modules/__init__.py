@@ -6,16 +6,23 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
+from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .rnd import *
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import *
 from .amp import *
+from .attn_enc_actor_critic import AttnEncActorCritic
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticCNN",
     "ActorCriticRecurrent",
+    "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",
+    "resolve_rnd_config",
+    "resolve_symmetry_config",
+    "AttnEncActorCritic",
 ]

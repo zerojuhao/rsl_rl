@@ -7,5 +7,6 @@
 
 from .rollout_storage import RolloutStorage
 from .circular_buffer import CircularBuffer
+from .attn_enc_rollout_storage import AttnEncRolloutStorage
 
-__all__ = ["RolloutStorage", "CircularBuffer"]
+__all__ = ["RolloutStorage", "CircularBuffer", "AttnEncRolloutStorage"]
