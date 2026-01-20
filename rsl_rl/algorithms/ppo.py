@@ -41,8 +41,8 @@ class PPO:
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
-        critic_estimation=False,
-        estimation_loss_coef=0.0,
+        enable_aux_loss: bool = False,
+        aux_loss_coef: float = 0.0,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -124,8 +124,8 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-        self.critic_estimation = critic_estimation
-        self.estimation_loss_coef = estimation_loss_coef
+        self.enable_aux_loss = enable_aux_loss
+        self.aux_loss_coef = aux_loss_coef
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -202,7 +202,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        mean_estimation_loss = 0 if self.critic_estimation else None
+        mean_aux_loss = 0 if self.enable_aux_loss else None
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -316,11 +316,11 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Estimation loss
-            if self.critic_estimation:
-                critic_loss = self.policy.get_estimation_loss()
+            # Auxiliary loss
+            if self.enable_aux_loss:
+                aux_loss = self.policy.get_aux_loss()
                 # add the loss to the total loss
-                loss += self.estimation_loss_coef * critic_loss
+                loss += self.aux_loss_coef * aux_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -399,8 +399,8 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            if mean_estimation_loss is not None:
-                mean_estimation_loss += critic_loss.item()
+            if mean_aux_loss is not None:
+                mean_aux_loss += aux_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -411,8 +411,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        if mean_estimation_loss is not None:
-            mean_estimation_loss /= num_updates
+        if mean_aux_loss is not None:
+            mean_aux_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -427,8 +427,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if self.critic_estimation:
-            loss_dict["estimation"] = mean_estimation_loss
+        if self.enable_aux_loss:
+            loss_dict["auxiliary"] = mean_aux_loss
 
         return loss_dict
 

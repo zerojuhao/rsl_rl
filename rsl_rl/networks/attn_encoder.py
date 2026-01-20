@@ -114,7 +114,7 @@ if __name__ == "__main__":
     proprioception = torch.randn(batch_size, d_obs)  # (4, 78)
 
     # 前向传播
-    embedding, attention, _ = model(proprioception, map_scans)
+    embedding, attention = model(proprioception, map_scans)
 
     print(f"输入地图扫描形状: {map_scans.shape}")
     print(f"输入本体感觉形状: {proprioception.shape}")

@@ -34,10 +34,14 @@ class ActorCriticAttnEnc(nn.Module):
         head_num: int = 8,
         map_size: tuple[int] = (17, 11),
         map_resolution: float = 0.1,
-        single_obs_dim: int = 78,
-        critic_estimation: bool = False,
-        estimation_slice:list [int] = [78, 79, 80],
-        estimator_hidden_dims: tuple[int] | list[int] = [256, 64],
+        actor_history_length=5,
+        critic_history_length=5,
+        enable_critic_estimation: bool = False,
+        estimation_slice:list[int] = [78, 79, 80],
+        estimaiton_hidden_dims: tuple[int] | list[int] = [256, 64],
+        enable_obs_encoder: bool = False,
+        obs_encoder_hidden_dims: tuple[int] | list[int] = [256, 64],
+        latent_dim: int = 0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -50,10 +54,12 @@ class ActorCriticAttnEnc(nn.Module):
         self.obs_groups = obs_groups
         self.num_actor_obs = 0
         self.map_size = map_size
-        self.single_obs_dim = single_obs_dim
-        self.critic_estimation = critic_estimation
+        self.actor_history_length = actor_history_length
+        self.critic_history_length = critic_history_length
+        self.enable_critic_estimation = enable_critic_estimation
         self.num_estimation = len(estimation_slice)
         self.estimation_slice = estimation_slice
+        self.enable_obs_encoder = enable_obs_encoder
         for obs_group in obs_groups["policy"]:
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             self.num_actor_obs += obs[obs_group].shape[-1]
@@ -61,26 +67,53 @@ class ActorCriticAttnEnc(nn.Module):
         for obs_group in obs_groups["critic"]:
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             self.num_critic_obs += obs[obs_group].shape[-1]
+        self.single_actor_obs_dim = self.num_actor_obs // self.actor_history_length
+        self.single_critic_obs_dim = self.num_critic_obs // self.critic_history_length
 
-        if self.critic_estimation:
+        if self.enable_critic_estimation:
             self.last_critic_pred: torch.Tensor = None
             self.last_critic_gt: torch.Tensor = None
-
-        # Encoder
-        if self.critic_estimation:
-            self.encoder =  AttentionEncoder(single_obs_dim+self.num_estimation, embedding_dim, head_num, self.map_size, map_resolution)
+        if self.enable_obs_encoder:
+            self.latent_dim = latent_dim
+            self.last_actor_latent: torch.Tensor = None
+            self.last_critic_latent: torch.Tensor = None
         else:
-            self.encoder =  AttentionEncoder(single_obs_dim, embedding_dim, head_num, self.map_size, map_resolution)
+            self.latent_dim = 0
+
+        # Attn Encoder
+        if self.enable_critic_estimation:
+            self.encoder =  AttentionEncoder(self.single_actor_obs_dim+self.num_estimation+self.latent_dim, embedding_dim, head_num, self.map_size, map_resolution)
+        else:
+            self.encoder =  AttentionEncoder(self.single_actor_obs_dim, embedding_dim, head_num, self.map_size, map_resolution)
         print(f"Encoder : {self.encoder}")
 
-        if self.critic_estimation:
-            self.estimator = MLP(self.num_actor_obs, self.num_estimation, estimator_hidden_dims, activation)
-            mlp_input_dim_a = embedding_dim + single_obs_dim + self.num_estimation
+        # Obs Encoder
+        if self.enable_obs_encoder:
+            self.actor_obs_encoder = MLP(self.num_actor_obs, self.latent_dim, obs_encoder_hidden_dims, activation)
+            self.critic_obs_encoder = MLP(self.num_critic_obs, self.latent_dim, obs_encoder_hidden_dims, activation)
+            print(f"Obs_a Encoder : {self.actor_obs_encoder}")
+            print(f"Obs_c Encoder : {self.critic_obs_encoder}")
+
+        # Estimator
+        if self.enable_critic_estimation:
+            if enable_obs_encoder:
+                self.estimator = MLP(self.latent_dim, self.num_estimation, [2*self.latent_dim], activation)
+            else:
+                self.estimator = MLP(self.num_actor_obs, self.num_estimation, estimaiton_hidden_dims, activation)
             print(f"Estimator : {self.estimator}")
+            mlp_input_dim_a = embedding_dim + self.single_actor_obs_dim + self.num_estimation
+            if self.enable_obs_encoder:
+                mlp_input_dim_a += self.latent_dim
         else:
-            mlp_input_dim_a = embedding_dim + self.num_actor_obs
+            if self.enable_obs_encoder:
+                mlp_input_dim_a = embedding_dim + self.single_actor_obs_dim + self.latent_dim
+            else:
+                mlp_input_dim_a = embedding_dim + self.num_actor_obs
         
-        mlp_input_dim_c = embedding_dim + self.num_critic_obs
+        if self.enable_obs_encoder:
+            mlp_input_dim_c = embedding_dim + self.single_critic_obs_dim + self.latent_dim
+        else:
+            mlp_input_dim_c = embedding_dim + self.num_critic_obs
 
         # Actor
         self.state_dependent_std = state_dependent_std
@@ -180,26 +213,40 @@ class ActorCriticAttnEnc(nn.Module):
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs, perception_obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        if self.critic_estimation:
-            self.last_critic_pred = self.estimator(obs)
-            obs = torch.cat([obs[:, -self.single_obs_dim:], self.last_critic_pred], dim=-1)
-            embedding, *_ = self.encoder(obs, perception_obs)
+        if self.enable_obs_encoder:
+            self.last_actor_latent = self.actor_obs_encoder(obs)
+            enc_obs = torch.cat([obs[:, -self.single_actor_obs_dim:], self.last_actor_latent], dim=-1)
         else:
-            embedding, *_ = self.encoder(obs[:, -self.single_obs_dim:], perception_obs)
-        obs = torch.cat([obs, embedding], dim=-1)
+            enc_obs = obs[:, -self.single_actor_obs_dim:]
+        if self.enable_critic_estimation:
+            esti_obs = self.last_actor_latent if self.enable_obs_encoder else obs
+            self.last_critic_pred = self.estimator(esti_obs)
+            enc_obs = torch.cat([enc_obs, self.last_critic_pred.detach()], dim=-1)
+        embedding, *_ = self.encoder(enc_obs, perception_obs)
+        if self.enable_critic_estimation or self.enable_obs_encoder:
+            obs = torch.cat([enc_obs, embedding], dim=-1)
+        else:
+            obs = torch.cat([obs, embedding], dim=-1)
         self._update_distribution(obs)
         return self.distribution.sample()
 
     def act_inference(self, obs: TensorDict, return_attention: bool = False) -> torch.Tensor:
         obs, perception_obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        if self.critic_estimation:
-            critic_pred = self.estimator(obs)
-            obs = torch.cat([obs[:, -self.single_obs_dim:], critic_pred], dim=-1)
-            embedding, attention = self.encoder(obs, perception_obs)
+        if self.enable_obs_encoder:
+            actor_latent = self.actor_obs_encoder(obs)
+            enc_obs = torch.cat([obs[:, -self.single_actor_obs_dim:], actor_latent], dim=-1)
         else:
-            embedding, attention = self.encoder(obs[:, -self.single_obs_dim:], perception_obs)
-        obs = torch.cat([obs, embedding], dim=-1)
+            enc_obs = obs[:, -self.single_actor_obs_dim:]
+        if self.enable_critic_estimation:
+            esti_obs = actor_latent if self.enable_obs_encoder else obs
+            critic_pred = self.estimator(esti_obs)
+            enc_obs = torch.cat([enc_obs, critic_pred.detach()], dim=-1)
+        embedding, attention = self.encoder(enc_obs, perception_obs)
+        if self.enable_critic_estimation or self.enable_obs_encoder:
+            obs = torch.cat([enc_obs, embedding], dim=-1)
+        else:
+            obs = torch.cat([obs, embedding], dim=-1)
         if self.state_dependent_std:
             actions = self.actor(obs)[..., 0, :]
         else:
@@ -212,12 +259,23 @@ class ActorCriticAttnEnc(nn.Module):
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs, perception_obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
-        if self.critic_estimation:
-            self.last_critic_gt = obs[:, self.estimation_slice]
-            embedding, *_ = self.encoder(torch.cat([obs[:, :self.single_obs_dim], self.last_critic_gt], dim=-1), perception_obs)
+        obs_2d = obs.view(-1, self.critic_history_length, self.single_critic_obs_dim)
+        last_obs = obs_2d[:, -1, :].flatten(1)
+        if self.enable_obs_encoder:
+            self.last_critic_latent = self.critic_obs_encoder(obs)
+            actor_obs = obs_2d[:, :, :self.single_actor_obs_dim].flatten(1)
+            actor_latent = self.actor_obs_encoder(actor_obs)
+            enc_obs = torch.cat([last_obs[:, :self.single_actor_obs_dim], actor_latent], dim=-1)
         else:
-            embedding, *_ = self.encoder(obs[:, :self.single_obs_dim], perception_obs)
-        obs = torch.cat([obs, embedding], dim=-1)
+            enc_obs = last_obs[:, :self.single_actor_obs_dim]
+        if self.enable_critic_estimation:
+            self.last_critic_gt = last_obs[:, self.estimation_slice].detach()
+            enc_obs = torch.cat([enc_obs, self.last_critic_gt], dim=-1)
+        embedding, *_ = self.encoder(enc_obs, perception_obs)
+        if self.enable_obs_encoder:
+            obs = torch.cat([last_obs, self.last_critic_latent, embedding], dim=-1)
+        else:
+            obs = torch.cat([obs, embedding], dim=-1)
         return self.critic(obs)
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
@@ -256,10 +314,12 @@ class ActorCriticAttnEnc(nn.Module):
         super().load_state_dict(state_dict, strict=strict)
         return True
 
-    def get_estimation_loss(self) -> torch.Tensor | None:
-        if self.critic_estimation and self.last_critic_pred is not None and self.last_critic_gt is not None:
-            critic_mse_loss = torch.nn.MSELoss()
-            critic_loss = critic_mse_loss(self.last_critic_pred, self.last_critic_gt.detach())
-            return critic_loss
-        else:
+    def get_aux_loss(self) -> torch.Tensor | None:
+        mse = torch.nn.MSELoss()
+        losses = []
+        if self.enable_critic_estimation and self.last_critic_pred is not None and self.last_critic_gt is not None:
+            losses.append(mse(self.last_critic_pred, self.last_critic_gt))
+        
+        if len(losses) == 0:
             return None
+        return sum(losses)
