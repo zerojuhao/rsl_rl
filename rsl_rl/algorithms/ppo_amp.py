@@ -9,7 +9,7 @@ from tensordict import TensorDict
 from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent, AMPDiscriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, CircularBuffer
-from rsl_rl.utils import string_to_callable
+from rsl_rl.utils import resolve_callable
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules.amp import LossType
 
