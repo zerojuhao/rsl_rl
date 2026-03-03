@@ -41,14 +41,14 @@ class PPO:
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
-        enable_aux_loss: bool = False,
-        aux_loss_coef: float = 0.0,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        enable_aux_loss: bool = False,
+        aux_loss_coef: float = 0.0,
     ) -> None:
         # Device-related parameters
         self.device = device
