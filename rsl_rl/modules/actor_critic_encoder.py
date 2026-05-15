@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, NoReturn
 
 import torch
@@ -82,6 +83,8 @@ class EncoderActorCritic(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        encoder_onnx_stems: dict[str, str] | None = None,
+        encoder_onnx_sequential_idx: int = 0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -90,6 +93,8 @@ class EncoderActorCritic(nn.Module):
                 + str([key for key in kwargs])
             )
         super().__init__()
+        self.encoder_onnx_stems = encoder_onnx_stems
+        self.encoder_onnx_sequential_idx = encoder_onnx_sequential_idx
         self.obs_groups = obs_groups
         self.actor_encoder_obs_groups = list(actor_encoder_obs_groups)
         self.critic_encoder_obs_groups = critic_encoder_obs_groups
@@ -313,3 +318,50 @@ class EncoderActorCritic(nn.Module):
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_as_onnx(self, obs: TensorDict, filedir: str) -> None:
+        """Export depth (or image) encoders as separate ONNX files and actor as ``actor.onnx``.
+
+        Encoder files are named ``{encoder_onnx_sequential_idx}-{stem}.onnx`` where ``stem`` comes from
+        ``encoder_onnx_stems[component_name]`` when set, otherwise ``component_name``. The actor subgraph
+        includes ``actor_obs_normalizer`` when enabled so deployment can feed raw concatenated features.
+        """
+        if self.state_dependent_std:
+            raise NotImplementedError(
+                "export_as_onnx does not support state_dependent_std=True; use a policy without this flag."
+            )
+        self.eval()
+        stems = self.encoder_onnx_stems or {}
+        seq = self.encoder_onnx_sequential_idx
+        with torch.no_grad():
+            group_obs = obs[self.actor_obs_group]
+            for component_name in self.actor_encoder_obs_groups:
+                stem = stems.get(component_name, component_name)
+                enc_in = group_obs[component_name]
+                enc = self.actor_encoders[component_name]
+                out_path = os.path.join(filedir, f"{seq}-{stem}.onnx")
+                torch.onnx.export(
+                    enc,
+                    enc_in,
+                    out_path,
+                    input_names=["input"],
+                    output_names=["output"],
+                    opset_version=12,
+                )
+                print(f"Exported encoder '{component_name}' to {out_path}")
+
+            actor_in = self.get_actor_obs(obs)
+            if self.actor_obs_normalization:
+                actor_module = nn.Sequential(self.actor_obs_normalizer, self.actor)
+            else:
+                actor_module = self.actor
+            actor_path = os.path.join(filedir, "actor.onnx")
+            torch.onnx.export(
+                actor_module,
+                actor_in,
+                actor_path,
+                input_names=["input"],
+                output_names=["output"],
+                opset_version=12,
+            )
+            print(f"Exported actor MLP to {actor_path}")

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -209,3 +210,18 @@ class ActorCritic(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_as_onnx(self, observations, filedir):
+        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
+        self.eval()
+        with torch.no_grad():
+            exported_program = torch.onnx.export(
+                self.actor,
+                observations,
+                os.path.join(filedir, "actor.onnx"),
+                input_names=["input"],
+                output_names=["output"],
+                opset_version=12,
+            )
+            print(f"Exported ActorCritic model to {os.path.join(filedir, 'actor.onnx')}")
+
