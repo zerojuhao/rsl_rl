@@ -13,7 +13,7 @@ from rsl_rl.utils import resolve_nn_activation
 
 
 class MoeLayer(nn.Module):
-    """Soft mixture-of-experts: gate mixes expert MLP outputs (same pattern as instinct_rl)."""
+    """Soft mixture-of-experts: gate mixes expert MLP outputs."""
 
     def __init__(
         self,
