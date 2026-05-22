@@ -114,8 +114,8 @@ class AMPRunner(OnPolicyRunner):
                 rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
             )
             
-            # Save model
-            if it % self.cfg["save_interval"] == 0:
+            # Save model (rank 0 only in distributed mode)
+            if it % self.cfg["save_interval"] == 0 and not self.logger.disable_logs:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
         # Save the final model after training
