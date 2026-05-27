@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -51,11 +52,8 @@ class ActorCritic(nn.Module):
 
         # Actor
         self.state_dependent_std = state_dependent_std
-        if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
-        else:
-            self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
-        print(f"Actor MLP: {self.actor}")
+        self.actor = self._build_actor(num_actor_obs, num_actions, actor_hidden_dims, activation)
+        print(f"Actor network: {self.actor}")
 
         # Actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -65,8 +63,8 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
 
         # Critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
-        print(f"Critic MLP: {self.critic}")
+        self.critic = self._build_critic(num_critic_obs, critic_hidden_dims, activation)
+        print(f"Critic network: {self.critic}")
 
         # Critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
@@ -101,6 +99,22 @@ class ActorCritic(nn.Module):
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
+
+    def _build_actor(
+        self,
+        num_actor_obs: int,
+        num_actions: int,
+        actor_hidden_dims: tuple[int] | list[int],
+        activation: str,
+    ) -> nn.Module:
+        if self.state_dependent_std:
+            return MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
+        return MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
+
+    def _build_critic(
+        self, num_critic_obs: int, critic_hidden_dims: tuple[int] | list[int], activation: str
+    ) -> nn.Module:
+        return MLP(num_critic_obs, 1, critic_hidden_dims, activation)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -196,3 +210,18 @@ class ActorCritic(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_as_onnx(self, observations, filedir):
+        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
+        self.eval()
+        with torch.no_grad():
+            exported_program = torch.onnx.export(
+                self.actor,
+                observations,
+                os.path.join(filedir, "actor.onnx"),
+                input_names=["input"],
+                output_names=["output"],
+                opset_version=12,
+            )
+            print(f"Exported ActorCritic model to {os.path.join(filedir, 'actor.onnx')}")
+

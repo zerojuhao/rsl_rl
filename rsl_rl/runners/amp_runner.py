@@ -14,6 +14,8 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
+    EncoderActorCritic,
+    EncoderMoEActorCritic,
     ActorCriticRecurrent,
     resolve_rnd_config,
     resolve_symmetry_config,
@@ -112,8 +114,8 @@ class AMPRunner(OnPolicyRunner):
                 rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
             )
             
-            # Save model
-            if it % self.cfg["save_interval"] == 0:
+            # Save model (rank 0 only in distributed mode)
+            if it % self.cfg["save_interval"] == 0 and not self.logger.disable_logs:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
         # Save the final model after training
@@ -201,7 +203,7 @@ class AMPRunner(OnPolicyRunner):
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | EncoderActorCritic | EncoderMoEActorCritic = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 

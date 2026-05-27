@@ -13,6 +13,24 @@ from rsl_rl.networks import HiddenState
 from rsl_rl.utils import split_and_pad_trajectories
 
 
+def _allocate_rollout_obs_buffer(obs_template: TensorDict, num_transitions_per_env: int, device: str) -> TensorDict:
+    """Allocate a rollout TensorDict with the same layout as ``obs_template`` (including nested groups).
+
+    The default ``TensorDict`` shape for a *nested* group (e.g. policy with ``concatenate_terms=False``) only reflects
+    batch dimensions. Using ``torch.zeros(T, *value.shape)`` in that case drops all feature dimensions and corrupts
+    training (symmetry / encoder). This helper prepends a time dimension while preserving leaves.
+    """
+
+    def expand(node: TensorDict | torch.Tensor) -> TensorDict | torch.Tensor:
+        if isinstance(node, torch.Tensor):
+            return torch.zeros(num_transitions_per_env, *node.shape, device=device, dtype=node.dtype)
+        children = {k: expand(v) for k, v in node.items()}
+        return TensorDict(children, batch_size=torch.Size([num_transitions_per_env, *node.batch_size]))
+
+    top = {k: expand(v) for k, v in obs_template.items()}
+    return TensorDict(top, batch_size=torch.Size([num_transitions_per_env, *obs_template.batch_size]), device=device)
+
+
 class RolloutStorage:
     """Storage for the data collected during a rollout.
 
@@ -54,11 +72,7 @@ class RolloutStorage:
         self.actions_shape = actions_shape
 
         # Core
-        self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
-            batch_size=[num_transitions_per_env, num_envs],
-            device=self.device,
-        )
+        self.observations = _allocate_rollout_obs_buffer(obs, num_transitions_per_env, device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()

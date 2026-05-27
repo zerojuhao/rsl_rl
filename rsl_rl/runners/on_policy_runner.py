@@ -124,8 +124,8 @@ class OnPolicyRunner:
                 rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
             )
 
-            # Save model
-            if it % self.cfg["save_interval"] == 0:
+            # Save model (rank 0 only in distributed mode)
+            if it % self.cfg["save_interval"] == 0 and not self.logger.disable_logs:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
         # Save the final model after training
@@ -243,7 +243,10 @@ class OnPolicyRunner:
             )
 
         # Initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
+            )
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
