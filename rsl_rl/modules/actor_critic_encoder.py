@@ -30,6 +30,7 @@ class Conv2dHeadModel(nn.Module):
         paddings: list[int] | None = None,
         nonlinearity: str = "ReLU",
         use_maxpool: bool = False,
+        last_activation: str | None = None,
     ) -> None:
         super().__init__()
         if paddings is None:
@@ -55,8 +56,9 @@ class Conv2dHeadModel(nn.Module):
         with torch.no_grad():
             probe = torch.zeros(1, *image_shape)
             conv_out_size = int(self.conv(probe).numel())
-        self.head = MLP(conv_out_size, output_size, hidden_sizes, nonlinearity.lower())
-
+        self.head = MLP(conv_out_size, output_size, hidden_sizes, nonlinearity.lower(), last_activation=last_activation)
+        self.out_features = output_size
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.conv(x).flatten(start_dim=1))
 
@@ -223,7 +225,7 @@ class EncoderActorCritic(nn.Module):
     def _encoder_output_size(self, encoders: nn.ModuleDict | None, obs_groups: list[str]) -> int:
         if encoders is None:
             return 0
-        return sum(encoders[obs_group].head[-1].out_features for obs_group in obs_groups)
+        return sum(encoders[obs_group].out_features for obs_group in obs_groups)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
