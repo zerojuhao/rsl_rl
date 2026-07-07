@@ -21,6 +21,7 @@ from rsl_rl.modules import (
     resolve_symmetry_config,
     resolve_amp_config,
 )
+from rsl_rl.modules.moe import collect_actor_moe_gate_log
 from rsl_rl.storage import RolloutStorage, CircularBuffer
 from rsl_rl.utils import resolve_obs_groups
 from rsl_rl.utils.logger import Logger
@@ -96,6 +97,7 @@ class AMPRunner(OnPolicyRunner):
 
             # Update policy
             loss_dict = self.alg.update()
+            loss_dict.update(collect_actor_moe_gate_log(self.alg.policy, obs))
 
             stop = time.time()
             learn_time = stop - start
