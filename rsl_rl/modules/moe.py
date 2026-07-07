@@ -5,11 +5,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from rsl_rl.utils import resolve_nn_activation
+
+if TYPE_CHECKING:
+    from tensordict import TensorDict
 
 
 class MoeLayer(nn.Module):
@@ -59,7 +64,35 @@ class MoeLayer(nn.Module):
         layers.append(nn.Linear(curr_dim, output_dim))
         return nn.Sequential(*layers)
 
+    def gate_scores(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softmax(self.gate(x), dim=-1)
+
+    @torch.no_grad()
+    def gate_stats(self, x: torch.Tensor) -> dict[str, float]:
+        gate_scores = self.gate_scores(x)
+        mean_weights = gate_scores.mean(dim=0)
+        entropy = -(gate_scores * (gate_scores + 1e-8).log()).sum(dim=-1).mean()
+        stats = {f"expert_{i}": mean_weights[i].item() for i in range(gate_scores.shape[-1])}
+        stats["gate_entropy"] = entropy.item()
+        stats["max_weight"] = gate_scores.max(dim=-1).values.mean().item()
+        return stats
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_scores = F.softmax(self.gate(x), dim=-1)
+        gate_scores = self.gate_scores(x)
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
         return torch.einsum("be,beo->bo", gate_scores, expert_outputs)
+
+
+def collect_actor_moe_gate_log(policy, obs: TensorDict) -> dict[str, float]:
+    """Return actor MoE gate statistics for logging (empty dict if policy is not MoE)."""
+    actor = getattr(policy, "actor", None)
+    if not isinstance(actor, MoeLayer):
+        return {}
+    if not hasattr(policy, "get_actor_obs"):
+        return {}
+    with torch.no_grad():
+        actor_obs = policy.get_actor_obs(obs)
+        if hasattr(policy, "actor_obs_normalizer"):
+            actor_obs = policy.actor_obs_normalizer(actor_obs)
+        stats = actor.gate_stats(actor_obs)
+    return {f"moe/actor/{key}": value for key, value in stats.items()}
