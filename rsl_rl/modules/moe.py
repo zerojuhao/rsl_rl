@@ -95,4 +95,4 @@ def collect_actor_moe_gate_log(policy, obs: TensorDict) -> dict[str, float]:
         if hasattr(policy, "actor_obs_normalizer"):
             actor_obs = policy.actor_obs_normalizer(actor_obs)
         stats = actor.gate_stats(actor_obs)
-    return {f"moe/actor/{key}": value for key, value in stats.items()}
+    return {f"Actor_MoE/{key}": value for key, value in stats.items()}

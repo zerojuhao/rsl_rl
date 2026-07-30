@@ -36,6 +36,24 @@ class AMPRunner(OnPolicyRunner):
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         super().__init__(env, train_cfg, log_dir, device)
         
+        self._foothold_env = getattr(self.env, "unwrapped", self.env)
+        foothold_cfg = self.cfg.get("foothold_imagination")
+        foothold_enabled = (
+            foothold_cfg.get("enabled", False)
+            if isinstance(foothold_cfg, dict)
+            else bool(getattr(foothold_cfg, "enabled", False))
+        )
+        if foothold_enabled:
+            configure = getattr(
+                self._foothold_env, "configure_foothold_imagination", None
+            )
+            if configure is None:
+                raise RuntimeError(
+                    "The environment does not support foothold imagination configuration."
+                )
+            configure(foothold_cfg)
+        self._foothold_guidance = getattr(self._foothold_env, "foothold_guidance", None)
+
         self.logger = LoggerAMP(
             log_dir=log_dir,
             cfg=self.cfg,
@@ -74,6 +92,15 @@ class AMPRunner(OnPolicyRunner):
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
                     actions = self.alg.act(obs)
+                    if self._foothold_guidance is not None:
+                        applied_actions = actions
+                        clip_actions = getattr(self.env, "clip_actions", None)
+                        if clip_actions is not None:
+                            applied_actions = torch.clamp(applied_actions, -clip_actions, clip_actions)
+                        self._foothold_env.prepare_foothold_prediction_step(
+                            obs["foothold_predictor"],
+                            applied_actions,
+                        )
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -97,7 +124,9 @@ class AMPRunner(OnPolicyRunner):
 
             # Update policy
             loss_dict = self.alg.update()
-            loss_dict.update(collect_actor_moe_gate_log(self.alg.policy, obs))
+            metrics_dict = collect_actor_moe_gate_log(self.alg.policy, obs)
+            if self._foothold_guidance is not None:
+                metrics_dict.update(self._foothold_env.update_foothold_predictor())
 
             stop = time.time()
             learn_time = stop - start
@@ -111,6 +140,7 @@ class AMPRunner(OnPolicyRunner):
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
+                metrics_dict=metrics_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.policy.action_std,
                 rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
@@ -141,6 +171,8 @@ class AMPRunner(OnPolicyRunner):
         saved_dict["amp_discriminator_state_dict"] = self.alg.amp_discriminator.state_dict()
         saved_dict["amp_discriminator_normalizer_state_dict"] = self.alg.amp_discriminator.disc_obs_normalizer.state_dict()
         saved_dict["amp_discriminator_optimizer_state_dict"] = self.alg.disc_optimizer.state_dict()
+        if self._foothold_guidance is not None:
+            saved_dict["foothold_guidance_state_dict"] = self._foothold_guidance.state_dict()
         torch.save(saved_dict, path)
 
         # Upload model to external logging services
@@ -156,6 +188,11 @@ class AMPRunner(OnPolicyRunner):
         # Load AMP model
         self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
         self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(loaded_dict["amp_discriminator_normalizer_state_dict"])
+        if self._foothold_guidance is not None and "foothold_guidance_state_dict" in loaded_dict:
+            self._foothold_guidance.load_state_dict(
+                loaded_dict["foothold_guidance_state_dict"],
+                load_optimizer=load_optimizer,
+            )
         # Load optimizer if used
         if load_optimizer and resumed_training:
             # Algorithm optimizer

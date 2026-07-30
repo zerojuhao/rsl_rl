@@ -105,6 +105,7 @@ class LoggerAMP(Logger):
         collect_time: float,
         learn_time: float,
         loss_dict: dict,
+        metrics_dict: dict,
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
@@ -146,6 +147,8 @@ class LoggerAMP(Logger):
             # Log losses
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
+            for key, value in metrics_dict.items():
+                self.writer.add_scalar(key, value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
 
             # Log noise std
