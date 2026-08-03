@@ -86,7 +86,8 @@ class EncoderActorCritic(nn.Module):
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         encoder_onnx_stems: dict[str, str] | None = None,
-        encoder_onnx_sequential_idx: int = 0,
+        encoder_onnx_sequential_idx: int | None = 0,
+        actor_onnx_filename: str = "actor.onnx",
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -97,6 +98,7 @@ class EncoderActorCritic(nn.Module):
         super().__init__()
         self.encoder_onnx_stems = encoder_onnx_stems
         self.encoder_onnx_sequential_idx = encoder_onnx_sequential_idx
+        self.actor_onnx_filename = actor_onnx_filename
         self.obs_groups = obs_groups
         self.actor_encoder_obs_groups = list(actor_encoder_obs_groups)
         self.critic_encoder_obs_groups = critic_encoder_obs_groups
@@ -322,11 +324,13 @@ class EncoderActorCritic(nn.Module):
         return True
 
     def export_as_onnx(self, obs: TensorDict, filedir: str) -> None:
-        """Export depth (or image) encoders as separate ONNX files and actor as ``actor.onnx``.
+        """Export depth (or image) encoders as separate ONNX files and the actor MLP.
 
-        Encoder files are named ``{encoder_onnx_sequential_idx}-{stem}.onnx`` where ``stem`` comes from
-        ``encoder_onnx_stems[component_name]`` when set, otherwise ``component_name``. The actor subgraph
-        includes ``actor_obs_normalizer`` when enabled so deployment can feed raw concatenated features.
+        Encoder files are named ``{stem}.onnx`` by default, where ``stem`` comes from
+        ``encoder_onnx_stems[component_name]`` when set, otherwise ``component_name``.
+        If ``encoder_onnx_sequential_idx`` is not ``None``, the file is named
+        ``{idx}-{stem}.onnx`` instead. The actor file uses ``actor_onnx_filename``
+        (default ``actor.onnx``) and includes ``actor_obs_normalizer`` when enabled.
         """
         if self.state_dependent_std:
             raise NotImplementedError(
@@ -341,7 +345,8 @@ class EncoderActorCritic(nn.Module):
                 stem = stems.get(component_name, component_name)
                 enc_in = group_obs[component_name]
                 enc = self.actor_encoders[component_name]
-                out_path = os.path.join(filedir, f"{seq}-{stem}.onnx")
+                filename = f"{seq}-{stem}.onnx" if seq is not None else f"{stem}.onnx"
+                out_path = os.path.join(filedir, filename)
                 torch.onnx.export(
                     enc,
                     enc_in,
@@ -357,7 +362,7 @@ class EncoderActorCritic(nn.Module):
                 actor_module = nn.Sequential(self.actor_obs_normalizer, self.actor)
             else:
                 actor_module = self.actor
-            actor_path = os.path.join(filedir, "actor.onnx")
+            actor_path = os.path.join(filedir, self.actor_onnx_filename)
             torch.onnx.export(
                 actor_module,
                 actor_in,

@@ -9,6 +9,10 @@ from .actor_critic import ActorCritic
 from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_encoder import Conv2dHeadModel, EncoderActorCritic
 from .actor_critic_encoder_moe import EncoderMoEActorCritic
+from .actor_critic_encoder_moe_multi_critic import (
+    EncoderMoEActorMultiCritic,
+    IndependentCritics,
+)
 from .actor_critic_moe import MoEActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .moe import MoeLayer
@@ -25,6 +29,8 @@ __all__ = [
     "Conv2dHeadModel",
     "EncoderActorCritic",
     "EncoderMoEActorCritic",
+    "EncoderMoEActorMultiCritic",
+    "IndependentCritics",
     "MoEActorCritic",
     "MoeLayer",
     "ActorCriticRecurrent",

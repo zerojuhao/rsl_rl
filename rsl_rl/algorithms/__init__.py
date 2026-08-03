@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .ppo_amp import PPOAMP
+from .multi_reward_ppo_amp import MultiRewardPPOAMP
 
-__all__ = ["PPO", "Distillation", "PPOAMP"]
+__all__ = ["PPO", "Distillation", "PPOAMP", "MultiRewardPPOAMP"]

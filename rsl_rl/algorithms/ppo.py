@@ -49,7 +49,23 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         enable_aux_loss: bool = False,
         aux_loss_coef: float = 0.0,
+        num_reward_heads: int = 1,
+        advantage_weights: list[float] | tuple[float, ...] | None = None,
     ) -> None:
+        if num_reward_heads < 1:
+            raise ValueError(f"num_reward_heads must be at least 1, got {num_reward_heads}.")
+        if storage.num_reward_heads != num_reward_heads:
+            raise ValueError(
+                "Storage and PPO disagree on the reward-head count: "
+                f"{storage.num_reward_heads} != {num_reward_heads}."
+            )
+        if advantage_weights is None:
+            advantage_weights = [1.0] * num_reward_heads
+        if len(advantage_weights) != num_reward_heads:
+            raise ValueError(
+                f"advantage_weights must have {num_reward_heads} entries, got {len(advantage_weights)}."
+            )
+
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -125,6 +141,34 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.enable_aux_loss = enable_aux_loss
         self.aux_loss_coef = aux_loss_coef
+        self.num_reward_heads = num_reward_heads
+        self.advantage_weights = torch.as_tensor(
+            advantage_weights, dtype=torch.float, device=self.device
+        )
+        self.reward_head_names = [f"head_{i}" for i in range(num_reward_heads)]
+
+    def _value_loss_terms(
+        self,
+        value_batch: torch.Tensor,
+        returns_batch: torch.Tensor,
+        target_values_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the scalar value loss and optional per-head means ``[num_reward_heads]``."""
+        if self.use_clipped_value_loss:
+            value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                -self.clip_param, self.clip_param
+            )
+            value_losses = (value_batch - returns_batch).pow(2)
+            value_losses_clipped = (value_clipped - returns_batch).pow(2)
+            per_elem = torch.max(value_losses, value_losses_clipped)
+        else:
+            per_elem = (returns_batch - value_batch).pow(2)
+        value_loss = per_elem.mean()
+        per_head = None
+        if self.num_reward_heads > 1:
+            reduce_dims = tuple(range(per_elem.ndim - 1))
+            per_head = per_elem.mean(dim=reduce_dims).detach()
+        return value_loss, per_head
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -132,6 +176,11 @@ class PPO:
         # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
+        if self.transition.values.ndim != 2 or self.transition.values.shape[-1] != self.num_reward_heads:
+            raise ValueError(
+                "Critic output must have shape [num_envs, num_reward_heads], got "
+                f"{tuple(self.transition.values.shape)} for num_reward_heads={self.num_reward_heads}."
+            )
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -149,6 +198,16 @@ class PPO:
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
+        if rewards.ndim == 1:
+            if self.num_reward_heads != 1:
+                raise ValueError(
+                    f"Expected rewards with {self.num_reward_heads} heads, got shape {tuple(rewards.shape)}."
+                )
+            rewards = rewards.unsqueeze(-1)
+        if rewards.ndim != 2 or rewards.shape[-1] != self.num_reward_heads:
+            raise ValueError(
+                f"Expected rewards with shape [num_envs, {self.num_reward_heads}], got {tuple(rewards.shape)}."
+            )
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
@@ -157,13 +216,13 @@ class PPO:
             # Compute the intrinsic rewards
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
-            self.transition.rewards += self.intrinsic_rewards
+            intrinsic_rewards = self.intrinsic_rewards.view(-1, 1)
+            self.transition.rewards[:, :1] += intrinsic_rewards
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
+            time_outs = extras["time_outs"].to(self.device).view(-1, 1)
+            self.transition.rewards += self.gamma * self.transition.values * time_outs
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -175,7 +234,7 @@ class PPO:
         # Compute value for the last step
         last_values = self.policy.evaluate(obs).detach()
         # Compute returns and advantages
-        advantage = 0
+        advantage = torch.zeros_like(last_values)
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
@@ -188,13 +247,20 @@ class PPO:
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
-        st.advantages = st.returns - st.values
+        st.per_head_advantages = st.returns - st.values
+        weights = self.advantage_weights.view(1, 1, self.num_reward_heads)
+        st.advantages = (st.per_head_advantages * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
+        mean_value_loss_per_head = (
+            torch.zeros(self.num_reward_heads, device=self.device)
+            if self.num_reward_heads > 1
+            else None
+        )
         mean_surrogate_loss = 0
         mean_entropy = 0
         # RND loss
@@ -303,15 +369,9 @@ class PPO:
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+            value_loss, value_loss_per_head = self._value_loss_terms(
+                value_batch, returns_batch, target_values_batch
+            )
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -390,6 +450,8 @@ class PPO:
 
             # Store the losses
             mean_value_loss += value_loss.item()
+            if mean_value_loss_per_head is not None and value_loss_per_head is not None:
+                mean_value_loss_per_head += value_loss_per_head
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             # RND loss
@@ -404,6 +466,8 @@ class PPO:
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
+        if mean_value_loss_per_head is not None:
+            mean_value_loss_per_head /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         if mean_rnd_loss is not None:
@@ -422,6 +486,11 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if mean_value_loss_per_head is not None:
+            for name, value in zip(
+                self.reward_head_names, mean_value_loss_per_head.tolist()
+            ):
+                loss_dict[f"value_{name}"] = value
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

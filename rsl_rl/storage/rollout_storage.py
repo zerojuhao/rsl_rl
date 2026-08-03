@@ -64,16 +64,22 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        num_reward_heads: int = 1,
     ) -> None:
+        if num_reward_heads < 1:
+            raise ValueError(f"num_reward_heads must be at least 1, got {num_reward_heads}.")
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.num_reward_heads = num_reward_heads
 
         # Core
         self.observations = _allocate_rollout_obs_buffer(obs, num_transitions_per_env, device)
-        self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.rewards = torch.zeros(
+            num_transitions_per_env, num_envs, self.num_reward_heads, device=self.device
+        )
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -83,11 +89,18 @@ class RolloutStorage:
 
         # For reinforcement learning
         if training_type == "rl":
-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.values = torch.zeros(
+                num_transitions_per_env, num_envs, self.num_reward_heads, device=self.device
+            )
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(
+                num_transitions_per_env, num_envs, self.num_reward_heads, device=self.device
+            )
+            self.per_head_advantages = torch.zeros(
+                num_transitions_per_env, num_envs, self.num_reward_heads, device=self.device
+            )
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For RNN networks
@@ -105,7 +118,7 @@ class RolloutStorage:
         # Core
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)
-        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.rewards[self.step].copy_(transition.rewards.view(self.num_envs, self.num_reward_heads))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation

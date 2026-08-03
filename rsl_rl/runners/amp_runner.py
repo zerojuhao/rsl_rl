@@ -9,13 +9,14 @@ from collections import deque
 from tensordict import TensorDict
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, PPOAMP
+from rsl_rl.algorithms import MultiRewardPPOAMP, PPO, PPOAMP
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
     EncoderActorCritic,
     EncoderMoEActorCritic,
+    EncoderMoEActorMultiCritic,
     ActorCriticRecurrent,
     resolve_rnd_config,
     resolve_symmetry_config,
@@ -66,6 +67,27 @@ class AMPRunner(OnPolicyRunner):
             max_episode_length_s=(self.env.max_episode_length*self.env.unwrapped.step_dt),
         )
 
+    def prepare_foothold_prediction_step(
+        self,
+        obs: TensorDict,
+        actions: torch.Tensor,
+        enable_inference_guidance: bool = False,
+    ) -> None:
+        """Prepare optional foothold guidance before advancing the environment."""
+        if self._foothold_guidance is None:
+            return
+        applied_actions = actions
+        clip_actions = getattr(self.env, "clip_actions", None)
+        if clip_actions is not None:
+            applied_actions = torch.clamp(
+                applied_actions, -clip_actions, clip_actions
+            )
+        self._foothold_env.prepare_foothold_prediction_step(
+            obs["foothold_predictor"],
+            applied_actions,
+            enable_inference_guidance=enable_inference_guidance,
+        )
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -92,15 +114,7 @@ class AMPRunner(OnPolicyRunner):
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
                     actions = self.alg.act(obs)
-                    if self._foothold_guidance is not None:
-                        applied_actions = actions
-                        clip_actions = getattr(self.env, "clip_actions", None)
-                        if clip_actions is not None:
-                            applied_actions = torch.clamp(applied_actions, -clip_actions, clip_actions)
-                        self._foothold_env.prepare_foothold_prediction_step(
-                            obs["foothold_predictor"],
-                            applied_actions,
-                        )
+                    self.prepare_foothold_prediction_step(obs, actions)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -113,7 +127,14 @@ class AMPRunner(OnPolicyRunner):
                     style_rewards = self.alg.style_rewards
                     total_rewards = self.alg.rewards_lerp
                     # Book keeping
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards, style_rewards, total_rewards)
+                    self.logger.process_env_step(
+                        getattr(self.alg, "task_rewards", rewards),
+                        dones,
+                        extras,
+                        intrinsic_rewards,
+                        style_rewards,
+                        total_rewards,
+                    )
 
                 stop = time.time()
                 collect_time = stop - start
@@ -159,6 +180,7 @@ class AMPRunner(OnPolicyRunner):
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "num_reward_heads": self.alg.num_reward_heads,
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -180,6 +202,13 @@ class AMPRunner(OnPolicyRunner):
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        checkpoint_heads = int(loaded_dict.get("num_reward_heads", 1))
+        if checkpoint_heads != self.alg.num_reward_heads:
+            raise RuntimeError(
+                "Checkpoint critic head count is incompatible with this run: "
+                f"{checkpoint_heads} != {self.alg.num_reward_heads}. "
+                "SSR multi-critic training must start from a compatible checkpoint."
+            )
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # Load RND model if used
@@ -240,15 +269,33 @@ class AMPRunner(OnPolicyRunner):
             if self.policy_cfg.get("critic_obs_normalization") is None:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
+        num_reward_heads = int(self.alg_cfg.get("num_reward_heads", 1))
+        if num_reward_heads > 1:
+            policy_num_reward_heads = int(
+                self.policy_cfg.get("num_reward_heads", num_reward_heads)
+            )
+            if policy_num_reward_heads != num_reward_heads:
+                raise ValueError(
+                    "Policy and algorithm disagree on num_reward_heads: "
+                    f"{policy_num_reward_heads} != {num_reward_heads}."
+                )
+            self.policy_cfg["num_reward_heads"] = num_reward_heads
+
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | EncoderActorCritic | EncoderMoEActorCritic = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | EncoderActorCritic | EncoderMoEActorCritic | EncoderMoEActorMultiCritic = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # Initialize the storage
         storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            "rl",
+            self.env.num_envs,
+            self.cfg["num_steps_per_env"],
+            obs,
+            [self.env.num_actions],
+            self.device,
+            num_reward_heads=num_reward_heads,
         )
         
         # Initialize AMP discriminator observation buffers
