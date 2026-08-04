@@ -133,6 +133,11 @@ class PPOAMP(PPO):
         
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
+        mean_value_loss_per_head = (
+            torch.zeros(self.num_reward_heads, device=self.device)
+            if self.num_reward_heads > 1
+            else None
+        )
         mean_surrogate_loss = 0
         mean_entropy = 0
         # RND loss
@@ -180,8 +185,9 @@ class PPOAMP(PPO):
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
 
-            # Check if we should normalize advantages per mini batch
-            if self.normalize_advantage_per_mini_batch:
+            # Check if we should normalize advantages per mini batch.
+            # Multi-head advantages are already per-head-normalized in compute_returns().
+            if self.normalize_advantage_per_mini_batch and self.num_reward_heads == 1:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
@@ -257,16 +263,10 @@ class PPOAMP(PPO):
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+            # Value function loss (keeps optional per-head stats for multi-critic)
+            value_loss, value_loss_per_head = self._value_loss_terms(
+                value_batch, returns_batch, target_values_batch
+            )
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -383,6 +383,8 @@ class PPOAMP(PPO):
 
             # Store the losses
             mean_value_loss += value_loss.item()
+            if mean_value_loss_per_head is not None and value_loss_per_head is not None:
+                mean_value_loss_per_head += value_loss_per_head
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             # RND loss
@@ -400,6 +402,8 @@ class PPOAMP(PPO):
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
+        if mean_value_loss_per_head is not None:
+            mean_value_loss_per_head /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         if mean_rnd_loss is not None:
@@ -420,6 +424,11 @@ class PPOAMP(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if mean_value_loss_per_head is not None:
+            for name, value in zip(
+                self.reward_head_names, mean_value_loss_per_head.tolist()
+            ):
+                loss_dict[f"value_{name}"] = value
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

@@ -51,6 +51,7 @@ class PPO:
         aux_loss_coef: float = 0.0,
         num_reward_heads: int = 1,
         advantage_weights: list[float] | tuple[float, ...] | None = None,
+        reward_head_names: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if num_reward_heads < 1:
             raise ValueError(f"num_reward_heads must be at least 1, got {num_reward_heads}.")
@@ -64,6 +65,13 @@ class PPO:
         if len(advantage_weights) != num_reward_heads:
             raise ValueError(
                 f"advantage_weights must have {num_reward_heads} entries, got {len(advantage_weights)}."
+            )
+        if reward_head_names is None:
+            reward_head_names = [f"head_{i}" for i in range(num_reward_heads)]
+        if len(reward_head_names) != num_reward_heads:
+            raise ValueError(
+                f"reward_head_names must have {num_reward_heads} entries, "
+                f"got {len(reward_head_names)}."
             )
 
         # Device-related parameters
@@ -145,7 +153,22 @@ class PPO:
         self.advantage_weights = torch.as_tensor(
             advantage_weights, dtype=torch.float, device=self.device
         )
-        self.reward_head_names = [f"head_{i}" for i in range(num_reward_heads)]
+        self.reward_head_names = list(reward_head_names)
+
+    def _aggregate_multi_head_advantages(self, per_head_advantages: torch.Tensor) -> torch.Tensor:
+        """Normalize each reward head, then weight-sum into a scalar advantage.
+
+        Matches the HoST/SSR multi-critic formulation:
+        ``A = sum_i w_i * (A_i - mean_i) / std_i``.
+        """
+        reduce_dims = tuple(range(per_head_advantages.ndim - 1))
+        mean = per_head_advantages.mean(dim=reduce_dims, keepdim=True)
+        std = per_head_advantages.std(dim=reduce_dims, keepdim=True)
+        normalized = (per_head_advantages - mean) / (std + 1e-8)
+        weights = self.advantage_weights.view(
+            *([1] * (per_head_advantages.ndim - 1)), self.num_reward_heads
+        )
+        return (normalized * weights).sum(dim=-1, keepdim=True)
 
     def _value_loss_terms(
         self,
@@ -248,11 +271,17 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.per_head_advantages = st.returns - st.values
-        weights = self.advantage_weights.view(1, 1, self.num_reward_heads)
-        st.advantages = (st.per_head_advantages * weights).sum(dim=-1, keepdim=True)
-        # Normalize the advantages if per minibatch normalization is not used
-        if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+        if self.num_reward_heads > 1:
+            # Multi-critic (HoST/SSR): normalize each head over the rollout, then
+            # weight-sum. Do not re-normalize the combined advantage.
+            st.advantages = self._aggregate_multi_head_advantages(st.per_head_advantages)
+        else:
+            st.advantages = st.per_head_advantages
+            # Normalize the advantages if per minibatch normalization is not used
+            if not self.normalize_advantage_per_mini_batch:
+                st.advantages = (st.advantages - st.advantages.mean()) / (
+                    st.advantages.std() + 1e-8
+                )
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -291,8 +320,9 @@ class PPO:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
 
-            # Check if we should normalize advantages per mini batch
-            if self.normalize_advantage_per_mini_batch:
+            # Check if we should normalize advantages per mini batch.
+            # Multi-head advantages are already per-head-normalized in compute_returns().
+            if self.normalize_advantage_per_mini_batch and self.num_reward_heads == 1:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 

@@ -45,12 +45,16 @@ class MultiRewardPPOAMP(PPOAMP):
         multi_gpu_cfg: dict | None = None,
         num_reward_heads: int = 3,
         advantage_weights: list[float] | tuple[float, ...] | None = None,
+        reward_head_names: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if num_reward_heads < 2:
             raise ValueError(
                 "MultiRewardPPOAMP requires at least two reward heads; "
                 "use PPOAMP for scalar AMP training."
             )
+        if reward_head_names is None and num_reward_heads == 3:
+            # SSR default critic-head order: locomotion, foothold, style.
+            reward_head_names = ["locomotion", "foothold", "style"]
 
         PPO.__init__(
             self,
@@ -75,6 +79,7 @@ class MultiRewardPPOAMP(PPOAMP):
             multi_gpu_cfg=multi_gpu_cfg,
             num_reward_heads=num_reward_heads,
             advantage_weights=advantage_weights,
+            reward_head_names=reward_head_names,
         )
 
         self.amp_cfg = amp_cfg
@@ -151,8 +156,8 @@ class MultiRewardPPOAMP(PPOAMP):
         )
 
         # Scalar summaries are for the existing AMP logger only. Training uses
-        # the unscaled reward heads and combines their independently computed
-        # advantages in PPO.compute_returns().
+        # the unscaled reward heads; PPO.compute_returns() normalizes each head
+        # then weight-sums advantages (HoST/SSR multi-critic).
         task_weights = self.advantage_weights[:-1]
         self.task_rewards = (rewards * task_weights).sum(dim=-1)
         self.rewards_lerp = (
