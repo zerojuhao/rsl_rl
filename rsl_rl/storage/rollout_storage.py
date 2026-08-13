@@ -52,6 +52,9 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            # Optional SSR Estimation teacher (not part of critic observations).
+            self.foothold_teacher_xy: torch.Tensor | None = None
+            self.foothold_actor_active: torch.Tensor | None = None
 
         def clear(self) -> None:
             self.__init__()
@@ -65,6 +68,7 @@ class RolloutStorage:
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
         num_reward_heads: int = 1,
+        foothold_teacher_dim: int | None = None,
     ) -> None:
         if num_reward_heads < 1:
             raise ValueError(f"num_reward_heads must be at least 1, got {num_reward_heads}.")
@@ -74,6 +78,7 @@ class RolloutStorage:
         self.num_envs = num_envs
         self.actions_shape = actions_shape
         self.num_reward_heads = num_reward_heads
+        self.foothold_teacher_dim = foothold_teacher_dim
 
         # Core
         self.observations = _allocate_rollout_obs_buffer(obs, num_transitions_per_env, device)
@@ -82,6 +87,17 @@ class RolloutStorage:
         )
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.foothold_teacher_xy: torch.Tensor | None = None
+        self.foothold_actor_active: torch.Tensor | None = None
+        if foothold_teacher_dim is not None:
+            if foothold_teacher_dim < 1:
+                raise ValueError(f"foothold_teacher_dim must be >= 1, got {foothold_teacher_dim}.")
+            self.foothold_teacher_xy = torch.zeros(
+                num_transitions_per_env, num_envs, foothold_teacher_dim, device=self.device
+            )
+            self.foothold_actor_active = torch.zeros(
+                num_transitions_per_env, num_envs, dtype=torch.bool, device=self.device
+            )
 
         # For distillation
         if training_type == "distillation":
@@ -120,6 +136,16 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(self.num_envs, self.num_reward_heads))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if self.foothold_teacher_xy is not None:
+            if transition.foothold_teacher_xy is None:
+                self.foothold_teacher_xy[self.step].zero_()
+            else:
+                self.foothold_teacher_xy[self.step].copy_(transition.foothold_teacher_xy)
+        if self.foothold_actor_active is not None:
+            if transition.foothold_actor_active is None:
+                self.foothold_actor_active[self.step] = False
+            else:
+                self.foothold_actor_active[self.step].copy_(transition.foothold_actor_active)
 
         # For distillation
         if self.training_type == "distillation":
@@ -162,6 +188,14 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
+        foothold_teacher = (
+            self.foothold_teacher_xy.flatten(0, 1) if self.foothold_teacher_xy is not None else None
+        )
+        foothold_actor_active = (
+            self.foothold_actor_active.flatten(0, 1)
+            if self.foothold_actor_active is not None
+            else None
+        )
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -185,6 +219,14 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                foothold_teacher_batch = (
+                    foothold_teacher[batch_idx] if foothold_teacher is not None else None
+                )
+                foothold_actor_active_batch = (
+                    foothold_actor_active[batch_idx]
+                    if foothold_actor_active is not None
+                    else None
+                )
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
@@ -205,6 +247,8 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    foothold_teacher_batch,
+                    foothold_actor_active_batch,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -277,6 +321,8 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    None,
+                    None,
                 )
 
                 first_traj = last_traj

@@ -23,6 +23,7 @@ from rsl_rl.modules import (
     resolve_amp_config,
 )
 from rsl_rl.modules.moe import collect_actor_moe_gate_log
+from rsl_rl.modules.ssr_estimation import FOOTHOLD_TEACHER_DIM
 from rsl_rl.storage import RolloutStorage, CircularBuffer
 from rsl_rl.utils import resolve_obs_groups
 from rsl_rl.utils.logger import Logger
@@ -54,6 +55,7 @@ class AMPRunner(OnPolicyRunner):
                 )
             configure(foothold_cfg)
         self._foothold_guidance = getattr(self._foothold_env, "foothold_guidance", None)
+        self._sync_foothold_estimation_gate()
 
         self.logger = LoggerAMP(
             log_dir=log_dir,
@@ -66,6 +68,7 @@ class AMPRunner(OnPolicyRunner):
             device=self.device,
             max_episode_length_s=(self.env.max_episode_length*self.env.unwrapped.step_dt),
         )
+        self.logger.configure_terrain_episode_length(self.env)
 
     def prepare_foothold_prediction_step(
         self,
@@ -73,20 +76,60 @@ class AMPRunner(OnPolicyRunner):
         actions: torch.Tensor,
         enable_inference_guidance: bool = False,
     ) -> None:
-        """Prepare optional foothold guidance before advancing the environment."""
+        """Run the privileged foothold teacher and store its pose on the transition."""
         if self._foothold_guidance is None:
             return
         applied_actions = actions
         clip_actions = getattr(self.env, "clip_actions", None)
         if clip_actions is not None:
-            applied_actions = torch.clamp(
-                applied_actions, -clip_actions, clip_actions
-            )
+            applied_actions = torch.clamp(applied_actions, -clip_actions, clip_actions)
         self._foothold_env.prepare_foothold_prediction_step(
-            obs["foothold_predictor"],
+            obs["critic"],
             applied_actions,
             enable_inference_guidance=enable_inference_guidance,
         )
+        self._record_foothold_teacher()
+
+    def _record_foothold_teacher(self) -> None:
+        """Copy teacher XY+yaw into the current transition for Estimation aux."""
+        if self._foothold_guidance is None:
+            return
+        transition = getattr(getattr(self, "alg", None), "transition", None)
+        if transition is None:
+            return
+        teacher = self._foothold_env.foothold_guidance.latest_mu_flat()
+        transition.foothold_teacher_xy = teacher.detach().clone()
+
+    def _sync_foothold_estimation_gate(self) -> None:
+        """Gate SSR foothold aux on privileged predictor ``reward_enabled``."""
+        policy = getattr(getattr(self, "alg", None), "policy", None)
+        if policy is None or not hasattr(policy, "set_foothold_teacher_ready"):
+            return
+        if not getattr(policy, "gate_foothold_estimation_on_predictor_ready", False):
+            policy.set_foothold_teacher_ready(True)
+            return
+        ready = False
+        guidance = self._foothold_guidance
+        if guidance is not None:
+            trainer = getattr(guidance, "trainer", None)
+            if trainer is not None:
+                ready = bool(trainer.reward_enabled)
+        policy.set_foothold_teacher_ready(ready)
+
+    def _apply_foothold_actor_mask(self) -> None:
+        """Zero actor ``f_hat`` on non-stairs environments."""
+        policy = getattr(getattr(self, "alg", None), "policy", None)
+        if policy is None or not hasattr(policy, "set_foothold_actor_mask"):
+            return
+        mask = None
+        if self._foothold_guidance is not None:
+            mask = self._foothold_guidance.stairs_active_mask()
+        policy.set_foothold_actor_mask(mask)
+        transition = getattr(getattr(self, "alg", None), "transition", None)
+        if transition is not None:
+            transition.foothold_actor_active = (
+                None if mask is None else mask.detach().clone()
+            )
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
@@ -113,6 +156,7 @@ class AMPRunner(OnPolicyRunner):
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
+                    self._apply_foothold_actor_mask()
                     actions = self.alg.act(obs)
                     self.prepare_foothold_prediction_step(obs, actions)
                     # Step the environment
@@ -145,9 +189,21 @@ class AMPRunner(OnPolicyRunner):
 
             # Update policy
             loss_dict = self.alg.update()
-            metrics_dict = collect_actor_moe_gate_log(self.alg.policy, obs)
+            self._apply_foothold_actor_mask()
+            terrain_names, terrain_ids = self.logger.terrain_moe_log_context()
+            metrics_dict = collect_actor_moe_gate_log(
+                self.alg.policy,
+                obs,
+                terrain_ids=terrain_ids,
+                terrain_names=terrain_names,
+            )
+            # Move Estimation/* diagnostics out of Loss/ so they share the Foothold/* namespace style.
+            for key in list(loss_dict.keys()):
+                if key.startswith("Estimation/"):
+                    metrics_dict[key] = loss_dict.pop(key)
             if self._foothold_guidance is not None:
                 metrics_dict.update(self._foothold_env.update_foothold_predictor())
+                self._sync_foothold_estimation_gate()
 
             stop = time.time()
             learn_time = stop - start
@@ -207,21 +263,30 @@ class AMPRunner(OnPolicyRunner):
             raise RuntimeError(
                 "Checkpoint critic head count is incompatible with this run: "
                 f"{checkpoint_heads} != {self.alg.num_reward_heads}. "
-                "SSR multi-critic training must start from a compatible checkpoint."
+                "Multi-critic training must start from a compatible checkpoint."
             )
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # Load RND model if used
         if self.alg_cfg["rnd_cfg"]:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        # Load AMP model
-        self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
-        self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(loaded_dict["amp_discriminator_normalizer_state_dict"])
+        # Load AMP model (tolerates disc obs-layout drift for play/export).
+        try:
+            self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
+            self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(
+                loaded_dict["amp_discriminator_normalizer_state_dict"]
+            )
+        except RuntimeError as exc:
+            print(
+                "[WARN] Skipping AMP discriminator load due to incompatible shapes "
+                f"(policy still loaded): {exc}"
+            )
         if self._foothold_guidance is not None and "foothold_guidance_state_dict" in loaded_dict:
             self._foothold_guidance.load_state_dict(
                 loaded_dict["foothold_guidance_state_dict"],
                 load_optimizer=load_optimizer,
             )
+        self._sync_foothold_estimation_gate()
         # Load optimizer if used
         if load_optimizer and resumed_training:
             # Algorithm optimizer
@@ -287,6 +352,14 @@ class AMPRunner(OnPolicyRunner):
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
+        foothold_cfg = self.cfg.get("foothold_imagination")
+        foothold_enabled = (
+            foothold_cfg.get("enabled", False)
+            if isinstance(foothold_cfg, dict)
+            else bool(getattr(foothold_cfg, "enabled", False))
+        )
+        foothold_teacher_dim = FOOTHOLD_TEACHER_DIM if foothold_enabled else None
+
         # Initialize the storage
         storage = RolloutStorage(
             "rl",
@@ -296,6 +369,7 @@ class AMPRunner(OnPolicyRunner):
             [self.env.num_actions],
             self.device,
             num_reward_heads=num_reward_heads,
+            foothold_teacher_dim=foothold_teacher_dim,
         )
         
         # Initialize AMP discriminator observation buffers

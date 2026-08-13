@@ -12,11 +12,10 @@ from rsl_rl.storage import CircularBuffer, RolloutStorage
 
 
 class MultiRewardPPOAMP(PPOAMP):
-    """PPOAMP variant with separate task/style reward and value streams.
+    """PPOAMP with multi-head rewards and values.
 
-    The legacy :class:`PPOAMP` remains a scalar-reward algorithm. This subclass
-    initializes the multi-head PPO state directly and only overrides reward
-    composition; it inherits the established AMP discriminator update.
+    Initializes multi-head PPO state and overrides reward composition; AMP
+    discriminator updates are inherited from :class:`PPOAMP`.
     """
 
     def __init__(
@@ -43,6 +42,8 @@ class MultiRewardPPOAMP(PPOAMP):
         symmetry_cfg: dict | None = None,
         amp_cfg: dict | None = None,
         multi_gpu_cfg: dict | None = None,
+        enable_aux_loss: bool = False,
+        aux_loss_coef: float = 0.0,
         num_reward_heads: int = 3,
         advantage_weights: list[float] | tuple[float, ...] | None = None,
         reward_head_names: list[str] | tuple[str, ...] | None = None,
@@ -53,7 +54,7 @@ class MultiRewardPPOAMP(PPOAMP):
                 "use PPOAMP for scalar AMP training."
             )
         if reward_head_names is None and num_reward_heads == 3:
-            # SSR default critic-head order: locomotion, foothold, style.
+            # Default critic-head order: locomotion, foothold, style.
             reward_head_names = ["locomotion", "foothold", "style"]
 
         PPO.__init__(
@@ -77,6 +78,8 @@ class MultiRewardPPOAMP(PPOAMP):
             rnd_cfg=rnd_cfg,
             symmetry_cfg=symmetry_cfg,
             multi_gpu_cfg=multi_gpu_cfg,
+            enable_aux_loss=enable_aux_loss,
+            aux_loss_coef=aux_loss_coef,
             num_reward_heads=num_reward_heads,
             advantage_weights=advantage_weights,
             reward_head_names=reward_head_names,
@@ -157,7 +160,7 @@ class MultiRewardPPOAMP(PPOAMP):
 
         # Scalar summaries are for the existing AMP logger only. Training uses
         # the unscaled reward heads; PPO.compute_returns() normalizes each head
-        # then weight-sums advantages (HoST/SSR multi-critic).
+        # then weight-sums advantages (multi-critic).
         task_weights = self.advantage_weights[:-1]
         self.task_rewards = (rewards * task_weights).sum(dim=-1)
         self.rewards_lerp = (

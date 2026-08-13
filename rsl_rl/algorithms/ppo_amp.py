@@ -8,6 +8,7 @@ from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent, AMPDiscriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
+from rsl_rl.modules.ssr_estimation import mirror_foothold_teacher_xy
 from rsl_rl.storage import RolloutStorage, CircularBuffer
 from rsl_rl.utils import resolve_callable
 from rsl_rl.algorithms import PPO
@@ -144,6 +145,10 @@ class PPOAMP(PPO):
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        mean_aux_loss = 0 if self.enable_aux_loss else None
+        mean_estimation_metrics: dict[str, float] | None = (
+            {} if self.enable_aux_loss else None
+        )
         # AMP discriminator loss and other info
         mean_disc_loss = 0
         mean_disc_grad_penalty = 0
@@ -180,6 +185,8 @@ class PPOAMP(PPO):
                 old_sigma_batch,
                 hidden_states_batch,
                 masks_batch,
+                foothold_teacher_batch,
+                foothold_actor_active_batch,
             ) = samples
             
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
@@ -208,10 +215,26 @@ class PPOAMP(PPO):
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
+                if foothold_teacher_batch is not None:
+                    foothold_teacher_batch = torch.cat(
+                        (
+                            foothold_teacher_batch,
+                            mirror_foothold_teacher_xy(foothold_teacher_batch),
+                        ),
+                        dim=0,
+                    )
+                if foothold_actor_active_batch is not None:
+                    foothold_actor_active_batch = foothold_actor_active_batch.repeat(num_aug)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
+            set_foothold_actor_mask = getattr(self.policy, "set_foothold_actor_mask", None)
+            if callable(set_foothold_actor_mask):
+                set_foothold_actor_mask(foothold_actor_active_batch)
             self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            set_foothold_teacher = getattr(self.policy, "set_foothold_teacher_target", None)
+            if callable(set_foothold_teacher):
+                set_foothold_teacher(foothold_teacher_batch)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             # Note: We only keep the entropy of the first augmentation (the original one)
@@ -269,6 +292,21 @@ class PPOAMP(PPO):
             )
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Auxiliary loss (e.g. estimation heads)
+            if self.enable_aux_loss:
+                get_aux = getattr(self.policy, "get_aux_loss_and_metrics", None)
+                if callable(get_aux):
+                    aux_loss, aux_metrics = get_aux()
+                else:
+                    aux_loss = self.policy.get_aux_loss()
+                    aux_metrics = {}
+                if aux_loss is None:
+                    aux_loss = torch.zeros((), device=self.device)
+                else:
+                    loss += self.aux_loss_coef * aux_loss
+                for key, value in aux_metrics.items():
+                    mean_estimation_metrics[key] = mean_estimation_metrics.get(key, 0.0) + value
 
             # Symmetry loss
             if self.symmetry:
@@ -393,6 +431,8 @@ class PPOAMP(PPO):
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            if mean_aux_loss is not None:
+                mean_aux_loss += aux_loss.item()
             # AMP discriminator loss and other info
             mean_disc_loss += disc_loss.item()
             mean_disc_grad_penalty += disc_grad_penalty.item()
@@ -410,6 +450,11 @@ class PPOAMP(PPO):
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_aux_loss is not None:
+            mean_aux_loss /= num_updates
+        if mean_estimation_metrics is not None:
+            for key in mean_estimation_metrics:
+                mean_estimation_metrics[key] /= num_updates
         mean_disc_loss /= num_updates
         mean_disc_grad_penalty /= num_updates
         mean_disc_score /= num_updates
@@ -433,6 +478,10 @@ class PPOAMP(PPO):
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.enable_aux_loss:
+            loss_dict["auxiliary"] = mean_aux_loss
+            if mean_estimation_metrics:
+                loss_dict.update(mean_estimation_metrics)
         loss_dict["amp/disc_loss"] = mean_disc_loss
         loss_dict["amp/disc_grad_penalty"] = mean_disc_grad_penalty
         loss_dict["amp/disc_score"] = mean_disc_score

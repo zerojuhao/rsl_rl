@@ -171,7 +171,6 @@ class Logger:
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 self.writer.add_scalar("Train/max_episode_length", max(self.lenbuffer), it)
-                self.writer.add_scalar("Train/min_episode_length", min(self.lenbuffer), it)
                 # if self.logger_type != "wandb":
                 #     self.writer.add_scalar(
                 #         "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)

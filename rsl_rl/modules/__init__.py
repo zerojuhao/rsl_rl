@@ -22,6 +22,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import resolve_symmetry_config
 from .amp import AMPDiscriminator, resolve_amp_config
+from .ssr_estimation import SSREstimationModule
 
 __all__ = [
     "ActorCritic",
@@ -35,6 +36,7 @@ __all__ = [
     "MoeLayer",
     "ActorCriticRecurrent",
     "ActorCriticAttnEnc",
+    "SSREstimationModule",
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",

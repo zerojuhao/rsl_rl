@@ -77,14 +77,48 @@ class MoeLayer(nn.Module):
         stats["max_weight"] = gate_scores.max(dim=-1).values.mean().item()
         return stats
 
+    @torch.no_grad()
+    def gate_stats_per_group(
+        self,
+        x: torch.Tensor,
+        group_ids: torch.Tensor,
+        group_names: list[str],
+        *,
+        prefix: str = "Actor_MoE_Terrain",
+    ) -> dict[str, float]:
+        """Mean gate weights for each named group (0 if a group has no samples)."""
+        gate_scores = self.gate_scores(x)
+        num_experts = gate_scores.shape[-1]
+        stats: dict[str, float] = {}
+        for gid, name in enumerate(group_names):
+            mask = group_ids == gid
+            if bool(mask.any()):
+                mean_weights = gate_scores[mask].mean(dim=0)
+                for i in range(num_experts):
+                    stats[f"{prefix}/{name}/expert_{i}"] = mean_weights[i].item()
+            else:
+                for i in range(num_experts):
+                    stats[f"{prefix}/{name}/expert_{i}"] = 0.0
+        return stats
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_scores = self.gate_scores(x)
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
         return torch.einsum("be,beo->bo", gate_scores, expert_outputs)
 
 
-def collect_actor_moe_gate_log(policy, obs: TensorDict) -> dict[str, float]:
-    """Return actor MoE gate statistics for logging (empty dict if policy is not MoE)."""
+def collect_actor_moe_gate_log(
+    policy,
+    obs: TensorDict,
+    *,
+    terrain_ids: torch.Tensor | None = None,
+    terrain_names: list[str] | None = None,
+) -> dict[str, float]:
+    """Return actor MoE gate statistics for logging (empty dict if policy is not MoE).
+
+    When ``terrain_ids`` / ``terrain_names`` are provided, also emits
+    ``Actor_MoE_Terrain/<sub_terrain>/expert_<i>``.
+    """
     actor = getattr(policy, "actor", None)
     if not isinstance(actor, MoeLayer):
         return {}
@@ -94,5 +128,19 @@ def collect_actor_moe_gate_log(policy, obs: TensorDict) -> dict[str, float]:
         actor_obs = policy.get_actor_obs(obs)
         if hasattr(policy, "actor_obs_normalizer"):
             actor_obs = policy.actor_obs_normalizer(actor_obs)
-        stats = actor.gate_stats(actor_obs)
-    return {f"Actor_MoE/{key}": value for key, value in stats.items()}
+        stats = {f"Actor_MoE/{key}": value for key, value in actor.gate_stats(actor_obs).items()}
+        if terrain_ids is not None and terrain_names:
+            if terrain_ids.shape[0] != actor_obs.shape[0]:
+                raise ValueError(
+                    "terrain_ids batch size must match actor obs: "
+                    f"{terrain_ids.shape[0]} != {actor_obs.shape[0]}."
+                )
+            stats.update(
+                actor.gate_stats_per_group(
+                    actor_obs,
+                    terrain_ids,
+                    terrain_names,
+                    prefix="Actor_MoE_Terrain",
+                )
+            )
+    return stats

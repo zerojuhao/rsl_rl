@@ -56,7 +56,20 @@ class Conv2dHeadModel(nn.Module):
         with torch.no_grad():
             probe = torch.zeros(1, *image_shape)
             conv_out_size = int(self.conv(probe).numel())
-        self.head = MLP(conv_out_size, output_size, hidden_sizes, nonlinearity.lower(), last_activation=last_activation)
+        if len(hidden_sizes) == 0:
+            # Direct projection (SSR paper: CNN → embedding, no extra MLP trunk).
+            head_layers: list[nn.Module] = [nn.Linear(conv_out_size, output_size)]
+            if last_activation is not None:
+                head_layers.append(getattr(nn, last_activation)())
+            self.head = nn.Sequential(*head_layers)
+        else:
+            self.head = MLP(
+                conv_out_size,
+                output_size,
+                hidden_sizes,
+                nonlinearity.lower(),
+                last_activation=last_activation,
+            )
         self.out_features = output_size
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:

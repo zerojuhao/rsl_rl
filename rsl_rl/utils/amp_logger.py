@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import git
-import os
-import pathlib
 import statistics
 import time
 import torch
 from collections import deque
+from typing import Any
 
 import rsl_rl
 
@@ -38,15 +36,65 @@ class LoggerAMP(Logger):
             gpu_global_rank,
             device,
         )
-        
+
         # Create buffers for logging AMP rewards and other info
         self.total_rewbuffer = deque(maxlen=100)
         self.style_rewbuffer = deque(maxlen=100)
         self.cur_total_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_style_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        
+
         self.max_episode_length_s = max_episode_length_s
-        
+
+        # Per-sub-terrain episode length / curriculum (see ``configure_terrain_episode_length``).
+        self._terrain_env: Any | None = None
+        self._terrain_names: list[str] = []
+        self.terrain_lenbuffers: dict[str, deque] = {}
+        self._ep_terrain_ids: torch.Tensor | None = None
+
+    def configure_terrain_episode_length(self, env: Any) -> None:
+        """Enable per-sub-terrain episode-length and curriculum-level logging."""
+        unwrapped = getattr(env, "unwrapped", env)
+        terrain = getattr(getattr(unwrapped, "scene", None), "terrain", None)
+        if terrain is None:
+            return
+        if getattr(terrain.cfg, "terrain_type", None) != "generator":
+            return
+        gen_cfg = getattr(terrain.cfg, "terrain_generator", None)
+        terrain_gen = getattr(terrain, "terrain_generator", None)
+        if gen_cfg is None or terrain_gen is None:
+            return
+        if not hasattr(terrain_gen, "get_subterrain_indices"):
+            return
+        names = list(gen_cfg.sub_terrains.keys())
+        if not names:
+            return
+        self._terrain_env = unwrapped
+        self._terrain_names = names
+        self.terrain_lenbuffers = {name: deque(maxlen=100) for name in names}
+        self._ep_terrain_ids = self._fetch_subterrain_ids()
+        print(
+            "[INFO] Terrain logging enabled for "
+            f"{len(names)} sub-terrains "
+            "(Terrain/mean_episode_length/*, TerrainCurriculum/mean_level/*, "
+            f"Actor_MoE_Terrain/*): {', '.join(names)}"
+        )
+
+    def _fetch_subterrain_ids(self) -> torch.Tensor | None:
+        if self._terrain_env is None or not self._terrain_names:
+            return None
+        terrain = self._terrain_env.scene.terrain
+        return terrain.terrain_generator.get_subterrain_indices(
+            terrain.terrain_levels,
+            terrain.terrain_types,
+            device=self.device,
+        )
+
+    def terrain_moe_log_context(self) -> tuple[list[str], torch.Tensor | None]:
+        """Return ``(sub_terrain_names, per-env subterrain ids)`` for MoE logging."""
+        if not self._terrain_names:
+            return [], None
+        return self._terrain_names, self._fetch_subterrain_ids()
+
     def process_env_step(
         self,
         rewards: torch.Tensor,
@@ -78,6 +126,16 @@ class LoggerAMP(Logger):
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
+            # Per-terrain lengths use cached ids from the finished episode (before refresh).
+            if len(new_ids) > 0 and self._ep_terrain_ids is not None and self._terrain_names:
+                done_env_ids = new_ids[:, 0]
+                lengths = self.cur_episode_length[done_env_ids]
+                terrain_ids = self._ep_terrain_ids[done_env_ids]
+                for length, terrain_id in zip(lengths.tolist(), terrain_ids.tolist()):
+                    tid = int(terrain_id)
+                    if 0 <= tid < len(self._terrain_names):
+                        self.terrain_lenbuffers[self._terrain_names[tid]].append(float(length))
+
             self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
             self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
             self.cur_reward_sum[new_ids] = 0
@@ -88,15 +146,27 @@ class LoggerAMP(Logger):
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
             if style_rewards is not None and total_rewards is not None:
-                amp_new_ids = new_ids if len(new_ids)>0 else slice(None)
-                style_rew_episode_mean = torch.mean(self.cur_style_reward_sum[amp_new_ids]) / (self.max_episode_length_s)
+                amp_new_ids = new_ids if len(new_ids) > 0 else slice(None)
+                style_rew_episode_mean = torch.mean(self.cur_style_reward_sum[amp_new_ids]) / (
+                    self.max_episode_length_s
+                )
                 if len(new_ids) > 0:
                     self.ep_extras[-1]["Episode_Reward/style"] = style_rew_episode_mean.item()
                 self.total_rewbuffer.extend(self.cur_total_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.style_rewbuffer.extend(self.cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_style_reward_sum[new_ids] = 0
                 self.cur_total_reward_sum[new_ids] = 0
-                
+
+            # After env.step reset, refresh terrain ids only for finished envs.
+            if len(new_ids) > 0 and self._ep_terrain_ids is not None and self._terrain_names:
+                done_env_ids = new_ids[:, 0]
+                terrain = self._terrain_env.scene.terrain
+                self._ep_terrain_ids[done_env_ids] = terrain.terrain_generator.get_subterrain_indices(
+                    terrain.terrain_levels[done_env_ids],
+                    terrain.terrain_types[done_env_ids],
+                    device=self.device,
+                )
+
     def log(
         self,
         it: int,
@@ -171,14 +241,26 @@ class LoggerAMP(Logger):
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 self.writer.add_scalar("Train/max_episode_length", max(self.lenbuffer), it)
-                self.writer.add_scalar("Train/min_episode_length", min(self.lenbuffer), it)
-                # if self.logger_type != "wandb":
-                #     self.writer.add_scalar(
-                #         "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)
-                #     )
-                #     self.writer.add_scalar(
-                #         "Train/mean_episode_length/time", statistics.mean(self.lenbuffer), int(self.tot_time)
-                #     )
+
+            # Per-sub-terrain mean episode length (0 when no finished episodes in the window).
+            for name in self._terrain_names:
+                buf = self.terrain_lenbuffers[name]
+                value = statistics.mean(buf) if len(buf) > 0 else 0.0
+                self.writer.add_scalar(f"Terrain/mean_episode_length/{name}", value, it)
+
+            # Per-sub-terrain mean curriculum level (current env assignment; 0 if unused).
+            if self._terrain_env is not None and self._terrain_names:
+                terrain = self._terrain_env.scene.terrain
+                levels = terrain.terrain_levels.float()
+                terrain_ids = terrain.terrain_generator.get_subterrain_indices(
+                    terrain.terrain_levels,
+                    terrain.terrain_types,
+                    device=self.device,
+                )
+                for tid, name in enumerate(self._terrain_names):
+                    mask = terrain_ids == tid
+                    value = float(levels[mask].mean().item()) if bool(mask.any()) else 0.0
+                    self.writer.add_scalar(f"TerrainCurriculum/mean_level/{name}", value, it)
 
             # Print to console
             log_string = f"""{"#" * width}\n"""
@@ -199,6 +281,19 @@ class LoggerAMP(Logger):
             # Print losses
             for key, value in loss_dict.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+
+            # Print key estimation / foothold diagnostics (already written to the writer).
+            for key in (
+                "Estimation/velocity_rmse",
+                "Estimation/foothold_xy_rmse",
+                "Estimation/foothold_yaw_rmse",
+                "Foothold/Accuracy/xy_rmse_m",
+                "Foothold/Accuracy/yaw_rmse_rad",
+                "Foothold/Guidance/reward_enabled",
+                "Foothold/Guidance/reward",
+            ):
+                if key in metrics_dict:
+                    log_string += f"""{f"{key}:":>{pad}} {metrics_dict[key]:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:

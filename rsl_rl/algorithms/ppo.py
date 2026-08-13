@@ -158,7 +158,7 @@ class PPO:
     def _aggregate_multi_head_advantages(self, per_head_advantages: torch.Tensor) -> torch.Tensor:
         """Normalize each reward head, then weight-sum into a scalar advantage.
 
-        Matches the HoST/SSR multi-critic formulation:
+        Matches the multi-critic formulation:
         ``A = sum_i w_i * (A_i - mean_i) / std_i``.
         """
         reduce_dims = tuple(range(per_head_advantages.ndim - 1))
@@ -272,7 +272,7 @@ class PPO:
         # Compute the advantages
         st.per_head_advantages = st.returns - st.values
         if self.num_reward_heads > 1:
-            # Multi-critic (HoST/SSR): normalize each head over the rollout, then
+            # Multi-critic: normalize each head over the rollout, then
             # weight-sum. Do not re-normalize the combined advantage.
             st.advantages = self._aggregate_multi_head_advantages(st.per_head_advantages)
         else:
@@ -316,6 +316,8 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            _foothold_teacher_batch,
+            _foothold_actor_active_batch,
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -408,8 +410,10 @@ class PPO:
             # Auxiliary loss
             if self.enable_aux_loss:
                 aux_loss = self.policy.get_aux_loss()
-                # add the loss to the total loss
-                loss += self.aux_loss_coef * aux_loss
+                if aux_loss is None:
+                    aux_loss = torch.zeros((), device=self.device)
+                else:
+                    loss += self.aux_loss_coef * aux_loss
 
             # Symmetry loss
             if self.symmetry:
