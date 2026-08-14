@@ -84,7 +84,7 @@ class AMPRunner(OnPolicyRunner):
         if clip_actions is not None:
             applied_actions = torch.clamp(applied_actions, -clip_actions, clip_actions)
         self._foothold_env.prepare_foothold_prediction_step(
-            obs["critic"],
+            obs,
             applied_actions,
             enable_inference_guidance=enable_inference_guidance,
         )

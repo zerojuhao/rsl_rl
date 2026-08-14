@@ -23,7 +23,6 @@ from tensordict import TensorDict
 
 from rsl_rl.networks import MLP
 
-FOOTHOLD_TEACHER_TERM = "foothold_teacher_xy"
 FOOTHOLD_TEACHER_DIM = 6
 
 
@@ -261,9 +260,6 @@ class SSREstimationModule(nn.Module):
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
         weighted: list[torch.Tensor] = []
         metrics: dict[str, float] = {}
-        if self.enable_actor_foothold:
-            metrics["Estimation/foothold_xy_rmse"] = 0.0
-            metrics["Estimation/foothold_yaw_rmse"] = 0.0
 
         def _add(
             name: str,
@@ -344,15 +340,17 @@ def resolve_estimation_dims(
         raise ValueError("SSR estimation requires at least one proprioceptive policy term.")
 
     left = critic_group["left_foot_height_map"]
-    if left.shape[-1] % history_length != 0:
-        raise ValueError("Critic foot height-map dims must be divisible by proprio history length.")
+    if left.shape[-1] % history_length == 0:
+        foot_height_dim = left.shape[-1] // history_length
+    else:
+        foot_height_dim = left.shape[-1]
 
     return SSREstimationDims(
         history_length=history_length,
         proprio_term_dims=proprio_term_dims,
         proprio_last_dim=sum(proprio_term_dims),
         depth_latent_dim=depth_latent_dim,
-        foot_height_dim=left.shape[-1] // history_length,
+        foot_height_dim=foot_height_dim,
         proprio_latent_dim=proprio_latent_dim,
         foothold_dim=FOOTHOLD_TEACHER_DIM,
         foot_height_actor_dim=foot_height_actor_dim,
@@ -374,8 +372,13 @@ def flatten_proprio_history(
 def last_history_frame(
     flat_history: torch.Tensor, history_length: int, frame_dim: int
 ) -> torch.Tensor:
-    if flat_history.shape[-1] != history_length * frame_dim:
+    last_dim = flat_history.shape[-1]
+    if last_dim == frame_dim:
+        return flat_history
+    expected = history_length * frame_dim
+    if last_dim != expected:
         raise ValueError(
-            f"Expected flat history dim {history_length * frame_dim}, got {flat_history.shape[-1]}."
+            f"Expected flat history dim {expected} or single-frame dim {frame_dim}, "
+            f"got {last_dim}."
         )
     return flat_history.view(flat_history.shape[0], history_length, frame_dim)[:, -1, :]

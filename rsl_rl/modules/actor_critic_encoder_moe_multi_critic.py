@@ -17,7 +17,6 @@ from rsl_rl.modules.moe import MoeLayer
 from rsl_rl.modules.ssr_estimation import (
     SSREstimationModule,
     resolve_estimation_dims,
-    FOOTHOLD_TEACHER_TERM,
 )
 from rsl_rl.networks import MLP
 
@@ -272,22 +271,6 @@ class EncoderMoEActorMultiCritic(EncoderMoEActorCritic):
         if self.estimation is None:
             return
         self.estimation.set_foothold_teacher_target(teacher)
-
-    def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
-        """Flatten critic terms, excluding the Estimation foothold teacher key."""
-        group_obs = obs[self.critic_obs_group]
-        obs_list = [
-            component_obs
-            for component_name, component_obs in group_obs.items()
-            if component_name not in self._critic_encoder_obs_groups_resolved
-            and component_name != FOOTHOLD_TEACHER_TERM
-        ]
-        if self.critic_encoders is not None:
-            obs_list.extend(
-                self.critic_encoders[component_name](group_obs[component_name])
-                for component_name in self._critic_encoder_obs_groups_resolved
-            )
-        return torch.cat(obs_list, dim=-1)
 
     def get_aux_loss(self) -> torch.Tensor | None:
         loss, _ = self.get_aux_loss_and_metrics()
