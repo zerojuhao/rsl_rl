@@ -299,6 +299,7 @@ class LoggerAMP(Logger):
                 "Foothold/Distribution/sigma_mean_m",
                 "Foothold/Horizon/h0_3/xy_rmse_m",
                 "Foothold/Horizon/h16p/xy_rmse_m",
+                "Foothold/Terrain/discrete/xy_rmse_m",
                 "Foothold/Terrain/stairs_down/xy_rmse_m",
                 "Foothold/Terrain/stairs_up/xy_rmse_m",
                 "Foothold/Contact/support_ratio",

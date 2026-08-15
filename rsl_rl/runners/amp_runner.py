@@ -117,13 +117,13 @@ class AMPRunner(OnPolicyRunner):
         policy.set_foothold_teacher_ready(ready)
 
     def _apply_foothold_actor_mask(self) -> None:
-        """Zero actor ``f_hat`` on non-stairs environments."""
+        """Zero actor ``f_hat`` outside foothold-guidance terrain families."""
         policy = getattr(getattr(self, "alg", None), "policy", None)
         if policy is None or not hasattr(policy, "set_foothold_actor_mask"):
             return
         mask = None
         if self._foothold_guidance is not None:
-            mask = self._foothold_guidance.stairs_active_mask()
+            mask = self._foothold_guidance.foothold_active_mask()
         policy.set_foothold_actor_mask(mask)
         transition = getattr(getattr(self, "alg", None), "transition", None)
         if transition is not None:
