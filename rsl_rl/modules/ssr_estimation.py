@@ -340,10 +340,16 @@ def resolve_estimation_dims(
         raise ValueError("SSR estimation requires at least one proprioceptive policy term.")
 
     left = critic_group["left_foot_height_map"]
-    if left.shape[-1] % history_length == 0:
-        foot_height_dim = left.shape[-1] // history_length
-    else:
-        foot_height_dim = left.shape[-1]
+    right = critic_group["right_foot_height_map"]
+    if left.shape[-1] != right.shape[-1]:
+        raise ValueError(
+            "Left and right foot height maps must have matching dimensions; "
+            f"got {left.shape[-1]} and {right.shape[-1]}."
+        )
+    # Foot height maps are configured as single-frame critic terms. Do not infer
+    # history from divisibility by the proprio history length: a 24x5 scan has
+    # 120 points and would otherwise be misread as 8 frames of 15 points.
+    foot_height_dim = left.shape[-1]
 
     return SSREstimationDims(
         history_length=history_length,
